@@ -64,7 +64,7 @@ variable "vms" {
       ip_address     = "172.16.50.100/24"
       gateway        = "172.16.50.254"
       ciuser         = "root"
-      cipassword     = "P4@xyM-1T&&%%"
+      cipassword     = "passwordhere"
     }
   ]
 }
