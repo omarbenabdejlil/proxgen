@@ -1,0 +1,247 @@
+#!/bin/bash
+
+# -----------------------------
+# Proxmox Template Creation Script with Checksum Verification
+# -----------------------------
+
+# Global Variables
+IMAGE_PATH="/var/lib/vz/template/images/"
+LOG_FILE="/var/log/proxmox_template_creation.log"
+IMAGES_FILE="images.txt"
+NODES_FILE="nodes.txt"
+
+# Ensure the image directory exists
+mkdir -p "$IMAGE_PATH"
+
+# Function to log messages
+log_message() {
+    local message="$1"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" | tee -a "$LOG_FILE"
+}
+
+# Function to load inventory from a file
+load_inventory() {
+    local file="$1"
+    declare -n array="$2"
+    while IFS='|' read -r key value; do
+        array["$key"]="$value"
+    done < "$file"
+}
+
+# Function to list and select from an inventory
+select_from_inventory() {
+    local title="$1"
+    declare -n inventory="$2"
+    declare -n selected_value="$3"
+    declare -n selected_key="$4"
+
+    log_message "🔍 $title"
+    local i=1
+    local keys=()
+    for key in "${!inventory[@]}"; do
+        keys+=("$key")
+        log_message "  $i) $key"
+        ((i++))
+    done
+
+    while true; do
+        read -p "Select an option (1-${#inventory[@]}): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#inventory[@]})); then
+            selected_key="${keys[$((choice-1))]}"
+            selected_value="${inventory[$selected_key]}"
+            break
+        else
+            log_message "❌ Invalid selection. Please try again."
+        fi
+    done
+}
+
+# Function to list available Proxmox nodes
+select_node() {
+    declare -A NODE_IPS
+    load_inventory "$NODES_FILE" NODE_IPS
+
+    select_from_inventory "Listing available Proxmox nodes" NODE_IPS NODE_IP NODE
+    log_message "✅ Node '$NODE' selected (IP: $NODE_IP)."
+}
+
+# Function to list available Proxmox storage locations
+select_proxmox_storage() {
+    log_message "🔍 Detecting available Proxmox storage..."
+    STORAGE_LOCATIONS=$(ssh "$NODE_IP" pvesm status | awk 'NR>1 {print $1}')
+
+    if [ -z "$STORAGE_LOCATIONS" ]; then
+        log_message "❌ No storage locations detected! Exiting..."
+        exit 1
+    fi
+
+    log_message "✅ Available Proxmox Storage Locations:"
+    PS3="Select Proxmox Storage: "
+    select STORAGE in $STORAGE_LOCATIONS; do
+        if [ -n "$STORAGE" ]; then
+            log_message "🎉 Selected storage: $STORAGE"
+            break
+        else
+            log_message "❌ Invalid selection. Please try again."
+        fi
+    done
+}
+
+# Function to list available network interfaces
+select_network_interface() {
+    log_message "🔍 Detecting available network interfaces..."
+    NETWORK_INTERFACES=$(ssh "$NODE_IP" ip -o link show | awk -F': ' '{print $2}' | grep -v lo)
+
+    if [ -z "$NETWORK_INTERFACES" ]; then
+        log_message "❌ No network interfaces detected! Exiting..."
+        exit 1
+    fi
+
+    log_message "✅ Available Network Interfaces:"
+    PS3="Select Network Interface: "
+    select INTERFACE in $NETWORK_INTERFACES; do
+        if [ -n "$INTERFACE" ]; then
+            log_message "🎉 Selected network interface: $INTERFACE"
+            break
+        else
+            log_message "❌ Invalid selection. Please try again."
+        fi
+    done
+}
+
+# Function to prompt the user for a template ID and check if it's available
+select_template_id() {
+    while true; do
+        echo "🔍 Please enter a template ID (must be an integer between 100 and 999999999):"
+        read TEMPLATE_ID
+
+        # Check if the provided ID is a valid integer
+        if [[ ! "$TEMPLATE_ID" =~ ^[0-9]+$ ]]; then
+            echo "❌ Template ID must be a number. Please try again."
+            continue
+        fi
+
+        # Check if the ID is within the valid range
+        if ((TEMPLATE_ID < 100 || TEMPLATE_ID > 999999999)); then
+            echo "❌ Template ID must be between 100 and 999999999. Please try again."
+            continue
+        fi
+
+        # Check if the ID is already in use by any VM or template
+        if ssh "$NODE_IP" qm list | awk '{print $1}' | grep -q "^$TEMPLATE_ID$"; then
+            echo "❌ Template ID $TEMPLATE_ID is already in use. Please choose another ID."
+        else
+            echo "✅ Assigned template ID: $TEMPLATE_ID"
+            break
+        fi
+    done
+}
+
+# Function to select an image from the inventory
+select_image() {
+    declare -A IMAGES
+    load_inventory "$IMAGES_FILE" IMAGES
+
+    select_from_inventory "Listing available images" IMAGES IMAGE_DATA IMAGE_NAME
+    IMAGE_URL=$(echo "$IMAGE_DATA" | cut -d'|' -f1)
+    CHECKSUM_URL=$(echo "$IMAGE_DATA" | cut -d'|' -f2)
+    log_message "✅ Image '$IMAGE_NAME' selected (URL: $IMAGE_URL)."
+}
+
+# Function to download the cloud image if not already present and verify checksum
+download_image() {
+    log_message "🔍 Checking if image is already downloaded..."
+    IMAGE_FILE="${IMAGE_PATH}${IMAGE_NAME}.qcow2"
+    if [ ! -f "$IMAGE_FILE" ]; then
+        log_message "⬇️ Downloading image: $IMAGE_NAME..."
+        if ! wget -O "$IMAGE_FILE" "$IMAGE_URL"; then
+            log_message "❌ Failed to download image. Exiting..."
+            exit 1
+        fi
+        log_message "✅ Download completed: $IMAGE_FILE"
+
+        log_message "🔍 Downloading checksum file..."
+        CHECKSUM_FILE="/tmp/${IMAGE_NAME}_checksum"
+        if ! wget -O "$CHECKSUM_FILE" "$CHECKSUM_URL"; then
+            log_message "❌ Failed to download checksum file. Exiting..."
+            rm -f "$IMAGE_FILE"
+            exit 1
+        fi
+
+        log_message "🔒 Verifying checksum..."
+        if grep -q "$(sha256sum "$IMAGE_FILE" | awk '{print $1}')" "$CHECKSUM_FILE"; then
+            log_message "✅ Checksum verification passed!"
+        else
+            log_message "❌ Checksum verification failed! Exiting..."
+            rm -f "$IMAGE_FILE"
+            exit 1
+        fi
+    else
+        log_message "✅ Image already exists: $IMAGE_FILE"
+    fi
+}
+
+# Function to create the Proxmox template
+create_template() {
+    log_message "🔧 Creating Proxmox template on node '$NODE' (IP: $NODE_IP)..."
+
+    # Use SSH to create the VM on the target node
+    if ! ssh "$NODE_IP" qm create "$TEMPLATE_ID" \
+        --name "$IMAGE_NAME-template" \
+        --memory 2048 \
+        --cores 2 \
+        --net0 "virtio,bridge=$INTERFACE" \
+        --scsi0 "$STORAGE:0,import-from=$IMAGE_FILE" \
+        --scsihw virtio-scsi-pci \
+        --ide2 "$STORAGE:cloudinit" \
+        --boot order=scsi0 \
+        --serial0 socket \
+        --vga serial0; then
+        log_message "❌ Failed to create VM. Exiting..."
+        exit 1
+    fi
+
+    log_message "✅ VM $TEMPLATE_ID created successfully on node '$NODE' (IP: $NODE_IP)!"
+
+    log_message "🔄 Converting VM $TEMPLATE_ID into a template..."
+    if ! ssh "$NODE_IP" qm template "$TEMPLATE_ID"; then
+        log_message "❌ Failed to convert VM into a template. Exiting..."
+        exit 1
+    fi
+    log_message "🎉 Template $TEMPLATE_ID successfully created on node '$NODE' (IP: $NODE_IP)!"
+}
+
+# Main script
+main() {
+    clear
+    echo "-----------------------------"
+    echo "🚀 Proxmox Template Creation Script with Checksum Verification"
+    echo "-----------------------------"
+
+    # Step 1: Select Proxmox node
+    select_node
+
+    # Step 2: Select Proxmox storage
+    select_proxmox_storage
+
+    # Step 3: Select network interface
+    select_network_interface
+
+    # Step 4: Dynamically assign a template ID
+    select_template_id
+
+    # Step 5: Select an image for the template
+    select_image
+
+    # Step 6: Download the selected image and verify checksum
+    download_image
+
+    # Step 7: Create the Proxmox template
+    create_template
+
+    log_message "🎉 Script completed successfully! Template ID: $TEMPLATE_ID"
+    echo "-----------------------------"
+}
+
+# Run the main function
+main

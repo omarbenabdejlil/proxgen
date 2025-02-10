@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# Colors
+GREEN="\e[32m"
+YELLOW="\e[33m"
+RED="\e[31m"
+BLUE="\e[34m"
+RESET="\e[0m"
+
+# Function to display a styled title
+display_title() {
+    local title="$1"
+    echo -e "${BLUE}========================================${RESET}"
+    echo -e "${BLUE} $title ${RESET}"
+    echo -e "${BLUE}========================================${RESET}"
+    echo
+}
+
+# Function to display a progress bar
+progress_bar() {
+    local width=50
+    local color="$1"
+    for ((i = 0; i <= width; i++)); do
+        printf "${color}[%-*s]\r" $width "$(printf "%0.s#" $(seq 1 $i))"
+        sleep 0.05
+    done
+    printf "\n"
+}
+
+# Function to list all VMs and their template status
+list_vms() {
+    local node_ip="$1"
+    ssh root@"$node_ip" '
+        qm list | awk "{if (\$3 == \"stopped\" || \$3 == \"running\") print \$1, \$2}"
+    '
+}
+
+# Function to delete a VM or template by its ID
+delete_vm() {
+    local node_ip="$1"
+    local vmid="$2"
+
+    # Attempt to shutdown the VM gracefully
+    echo -e "${YELLOW}🔄 Attempting to shut down VM with ID $vmid...${RESET}"
+    shutdown_result=$(ssh root@"$node_ip" "qm shutdown $vmid")
+
+    # Check if shutdown was successful
+    if [[ "$shutdown_result" == *"shut down"* ]]; then
+        echo -e "${GREEN}✅ VM with ID $vmid has been shut down successfully.${RESET}"
+    else
+        # If graceful shutdown fails, force stop the VM
+        echo -e "${YELLOW}⚠️ Graceful shutdown failed, forcing VM to stop...${RESET}"
+        ssh root@"$node_ip" "qm stop $vmid"
+        echo -e "${GREEN}✅ VM with ID $vmid has been forcefully stopped.${RESET}"
+    fi
+
+    # Now, delete the VM
+    ssh root@"$node_ip" "qm destroy $vmid --destroy-unreferenced-disks"
+    echo -e "${GREEN}✅ VM or template with ID $vmid has been deleted.${RESET}"
+}
+
+# Check if nodes.txt file exists
+if [ ! -f nodes.txt ]; then
+    echo -e "${RED}❌ nodes.txt file not found! Please create the file and add your nodes.${RESET}"
+    exit 1
+fi
+
+# Load nodes from the external nodes.txt file
+display_title "Proxmox VM Manager"
+echo -e "${BLUE}🔍 Fetching VMs and templates from all Proxmox nodes...${RESET}"
+mapfile -t nodes < nodes.txt
+
+# Loop through each node and list VMs
+for node_info in "${nodes[@]}"; do
+    node_name=$(echo "$node_info" | cut -d'|' -f1)
+    node_ip=$(echo "$node_info" | cut -d'|' -f2)
+
+    echo -e "${GREEN}✅ Fetching VMs from node '$node_name' with IP '$node_ip'...${RESET}"
+    vms=$(list_vms "$node_ip")
+
+    if [ -z "$vms" ]; then
+        echo -e "${YELLOW}⚠️ No VMs found on node '$node_name'.${RESET}"
+    else
+        echo -e "${BLUE}Available VMs and templates on '$node_name':${RESET}"
+        echo "$vms"
+    fi
+done
+
+# Prompt user to select VM ID to delete
+read -p "$(echo -e "${BLUE}Enter the ID of the VM or template you want to delete: ${RESET}")" vmid
+
+# Confirmation
+echo -e "${YELLOW}⚠️ Are you sure you want to delete VM or template with ID $vmid?${RESET}"
+read -p "$(echo -e "${YELLOW}Type 'yes' to confirm or 'no' to cancel: ${RESET}")" confirm
+
+if [[ "$confirm" == "yes" ]]; then
+    # Delete VM from all nodes (if it exists on any node)
+    progress_bar "$BLUE"
+    for node_info in "${nodes[@]}"; do
+        node_ip=$(echo "$node_info" | cut -d'|' -f2)
+
+        # Check if the VM exists on the node
+        vm_exists=$(ssh root@"$node_ip" "qm list | awk '{if (\$1 == \"$vmid\") print \$1}'")
+
+        if [ "$vm_exists" == "$vmid" ]; then
+            delete_vm "$node_ip" "$vmid"
+        fi
+    done
+else
+    echo -e "${RED}❌ VM deletion canceled.${RESET}"
+fi

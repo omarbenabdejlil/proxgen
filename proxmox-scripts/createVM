@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# ==============================
+# Interactive VM Creation Script
+# ==============================
+
+# Global Variables
+NODES_FILE="nodes.txt"
+
+# Function to check IP availability
+check_ip_availability() {
+    local ip=$1
+    if ping -c 1 -W 1 "$ip" &> /dev/null; then
+        echo "IP address $ip is already in use!"
+        return 1
+    else
+        echo "IP address $ip is available."
+        return 0
+    fi
+}
+
+# Function to load inventory from a file
+load_inventory() {
+    local file="$1"
+    declare -n array="$2"
+    while IFS='|' read -r key value; do
+        array["$key"]="$value"
+    done < "$file"
+}
+
+# Function to list and select from an inventory
+select_from_inventory() {
+    local title="$1"
+    declare -n inventory="$2"
+    declare -n selected_value="$3"
+    declare -n selected_key="$4"
+
+    echo "🔍 $title"
+    local i=1
+    local keys=()
+    for key in "${!inventory[@]}"; do
+        keys+=("$key")
+        echo "  $i) $key"
+        ((i++))
+    done
+
+    while true; do
+        read -p "Select an option (1-${#inventory[@]}): " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#inventory[@]})); then
+            selected_key="${keys[$((choice-1))]}"
+            selected_value="${inventory[$selected_key]}"
+            break
+        else
+            echo "❌ Invalid selection. Please try again."
+        fi
+    done
+}
+
+# Select a node
+select_node() {
+    declare -A NODE_IPS
+    load_inventory "$NODES_FILE" NODE_IPS
+
+    select_from_inventory "Listing available Proxmox nodes" NODE_IPS NODE_IP NODE
+    echo "✅ Node '$NODE' selected (IP: $NODE_IP)."
+}
+
+# Function to get templates from a specific node
+get_templates() {
+    local node_ip="$1"
+    ssh root@"$node_ip" '
+        qm list | awk "{if (\$3 == \"stopped\") print \$1}" | while read -r vmid; do
+            if qm config "$vmid" | grep -q "^template: 1"; then
+                # Get the VM ID and template name
+                vm_name=$(qm config "$vmid" | grep "^name:" | awk "{print \$2}")
+                echo "$vmid - $vm_name"
+            fi
+        done
+    '
+}
+#Main script
+main() {
+    clear
+    echo "Fetching available VM templates..."
+
+    # Select a node
+    select_node
+
+    # Fetch templates from the selected node
+    TEMPLATES=$(get_templates "$NODE_IP")
+
+    # Display the list of templates
+    if [ -z "$TEMPLATES" ]; then
+        echo "No templates found!"
+        exit 1
+    fi
+
+    echo "Available templates:"
+    echo "$TEMPLATES"
+    echo ""
+
+    # Select template ID
+    read -p "Enter the Template ID to clone: " TEMPLATE_ID
+
+    # Check if template ID exists
+    if ! echo "$TEMPLATES" | grep -q "^$TEMPLATE_ID "; then
+        echo "Invalid Template ID!"
+        exit 1
+    fi
+
+    # Prompt for VM details (with default values)
+    echo "--------------------------------------------------------------------------------"
+    echo "Press Enter to set the default variable"
+    echo "--------------------------------------------------------------------------------"
+    read -p "Enter new VM Name (Default: VM-$(date +%Y%m%d%H%M)): " NEW_VM_NAME
+    NEW_VM_NAME=${NEW_VM_NAME:-VM-$(date +%Y%m%d%H%M)}
+    NEW_VM_ID=$(ssh "$NODE_IP" pvesh get /cluster/nextid)
+
+    # Cloud-Init Defaults
+    DEFAULT_CLOUD_INIT_USER="support"
+    DEFAULT_CLOUD_INIT_PASSWORD="erty"
+    DEFAULT_CLOUD_INIT_IP="172.16.50.113"
+    DEFAULT_CLOUD_INIT_NETMASK="24"
+    DEFAULT_CLOUD_INIT_GATEWAY="172.16.50.254"
+    DEFAULT_CLOUD_INIT_NAMESERVER="8.8.8.8"
+    DEFAULT_CLOUD_INIT_SEARCHDOMAIN="google.com"
+    DEFAULT_SSH_KEY="$HOME/.ssh/id_rsa.pub"
+
+    # Cloud-Init user input with defaults
+    read -p "Enter Cloud-Init Username (Default: $DEFAULT_CLOUD_INIT_USER): " CLOUD_INIT_USER
+    CLOUD_INIT_USER=${CLOUD_INIT_USER:-$DEFAULT_CLOUD_INIT_USER}
+
+    read -s -p "Enter Cloud-Init Password (Default: $DEFAULT_CLOUD_INIT_PASSWORD): " CLOUD_INIT_PASSWORD
+    echo ""  # Move to a new line after password input
+    CLOUD_INIT_PASSWORD=${CLOUD_INIT_PASSWORD:-$DEFAULT_CLOUD_INIT_PASSWORD}
+
+    while true; do
+        read -p "Enter VM IP Address (Default: $DEFAULT_CLOUD_INIT_IP): " CLOUD_INIT_IP
+        CLOUD_INIT_IP=${CLOUD_INIT_IP:-$DEFAULT_CLOUD_INIT_IP}
+
+        read -p "Enter Netmask (Default: $DEFAULT_CLOUD_INIT_NETMASK): " CLOUD_INIT_NETMASK
+        CLOUD_INIT_NETMASK=${CLOUD_INIT_NETMASK:-$DEFAULT_CLOUD_INIT_NETMASK}
+
+        # Check IP availability
+        if check_ip_availability "$CLOUD_INIT_IP"; then
+            break
+        else
+            echo "Please choose a different IP address."
+        fi
+    done
+
+    read -p "Enter Gateway Address (Default: $DEFAULT_CLOUD_INIT_GATEWAY): " CLOUD_INIT_GATEWAY
+    CLOUD_INIT_GATEWAY=${CLOUD_INIT_GATEWAY:-$DEFAULT_CLOUD_INIT_GATEWAY}
+
+    read -p "Enter DNS Nameserver (Default: $DEFAULT_CLOUD_INIT_NAMESERVER): " CLOUD_INIT_NAMESERVER
+    CLOUD_INIT_NAMESERVER=${CLOUD_INIT_NAMESERVER:-$DEFAULT_CLOUD_INIT_NAMESERVER}
+
+    read -p "Enter Search Domain (Default: $DEFAULT_CLOUD_INIT_SEARCHDOMAIN): " CLOUD_INIT_SEARCHDOMAIN
+    CLOUD_INIT_SEARCHDOMAIN=${CLOUD_INIT_SEARCHDOMAIN:-$DEFAULT_CLOUD_INIT_SEARCHDOMAIN}
+
+    read -p "Enter SSH public key path (Press Enter to use ${DEFAULT_SSH_KEY}): " CLOUD_INIT_SSHKEY
+    CLOUD_INIT_SSHKEY=${CLOUD_INIT_SSHKEY:-$DEFAULT_SSH_KEY}
+
+    # Hardware Configuration Defaults
+    DEFAULT_RAM="2048"
+    DEFAULT_CPU="2"
+    DEFAULT_STORAGE="10"
+    DEFAULT_VLAN_TAG="50"
+
+    read -p "Enter RAM size in MB (Default: $DEFAULT_RAM MB): " VM_RAM
+    VM_RAM=${VM_RAM:-$DEFAULT_RAM}
+
+    read -p "Enter number of CPUs (Default: $DEFAULT_CPU): " VM_CPU
+    VM_CPU=${VM_CPU:-$DEFAULT_CPU}
+
+    read -p "Enter disk size in GB (Default: $DEFAULT_STORAGE GB): " VM_STORAGE
+    VM_STORAGE=${VM_STORAGE:-$DEFAULT_STORAGE}
+
+    read -p "Enter VLAN ID for network (Default: $DEFAULT_VLAN_TAG, enter 0 for no VLAN): " VLAN_TAG
+    VLAN_TAG=${VLAN_TAG:-$DEFAULT_VLAN_TAG}
+
+    echo "Cloning template ID ${TEMPLATE_ID} to create new VM..."
+    ssh "$NODE_IP" qm clone "${TEMPLATE_ID}" "${NEW_VM_ID}" --name "${NEW_VM_NAME}"
+
+    if [ $? -ne 0 ]; then
+        echo "Failed to clone the template!"
+        exit 1
+    fi
+
+    echo "Configuring Cloud-Init and hardware for VM ID ${NEW_VM_ID}..."
+    ssh "$NODE_IP" qm set "${NEW_VM_ID}" --ciuser "${CLOUD_INIT_USER}" --cipassword "${CLOUD_INIT_PASSWORD}" --sshkeys "${CLOUD_INIT_SSHKEY}"
+    ssh "$NODE_IP" qm set "${NEW_VM_ID}" --ipconfig0 ip="${CLOUD_INIT_IP}/${CLOUD_INIT_NETMASK}",gw="${CLOUD_INIT_GATEWAY}" --nameserver "${CLOUD_INIT_NAMESERVER}" --searchdomain "${CLOUD_INIT_SEARCHDOMAIN}"
+
+    echo "Configuring hardware for VM ID ${NEW_VM_ID}..."
+    ssh "$NODE_IP" qm set "${NEW_VM_ID}" --memory "${VM_RAM}" --cores "${VM_CPU}" --net0 model=e1000,bridge=vmbr0,tag="${VLAN_TAG}" --scsihw virtio-scsi-pci --scsi0 local-lvm:vm-${NEW_VM_ID}-disk-0:"${VM_STORAGE}G"
+
+    echo "Successfully created and configured VM ID ${NEW_VM_ID}!"
+}
+
+main
